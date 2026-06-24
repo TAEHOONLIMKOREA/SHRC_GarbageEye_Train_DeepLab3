@@ -94,11 +94,17 @@ Train_DeepLab3/
 ```
 
 `labelmap.txt` 형식 (`#` 주석 및 빈 줄 허용):
+파인튜닝 할 때, 클래스 픽셀 컬러값은 달라도 상관없으나 labelmap의 클래스 순서는 맞춰야함.
+(class 순서가 index로 매핑돼서 학습되기 때문)
 
 ```
 # 클래스명:R,G,B
-Background:0,0,0
-Garbage:255,0,0
+background:0,0,0::
+garbage:255,53,94::
+ground:245,147,49::
+robot:51,221,255::
+sea:61,61,245::
+ship:250,250,55::
 ...
 ```
 
