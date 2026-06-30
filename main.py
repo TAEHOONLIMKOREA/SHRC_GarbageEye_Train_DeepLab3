@@ -1,70 +1,95 @@
-from Module.TrainMethods import data_generator, read_image, train, continue_train
-from Module.InferMethods import plot_random_predictions, calculate_accuracy_from_dataset, generate_synthetic_accuracy, calculate_random_accuracy, create_colormap, infer
-from Module.ProcessingMethods import display_images_and_masks, validate_count_of_images_and_masks, validate_mask_classes
-from tensorflow import keras
-from keras import layers
 import os
+import re
 from glob import glob
+from collections import defaultdict
+
+from Module.TrainMethods import data_generator, continue_train
 
 
-NUM_CLASSES = 6
-# DATA_DIR = "./SHRC_GarbageDetection/Data/TrainDataSet"
-DATA_DIR = "/home/keti_taehoon/SHRC_DeepLab3Plus_Learning/Data/TrainDataSet_Oct_50m"
-# LBAEL_PATH = "./SHRC_GarbageDetection/Data/TrainDataSet/labelmap.txt"
-LBAEL_PATH = "/home/keti_taehoon/SHRC_DeepLab3Plus_Learning/Data/TrainDataSet_Oct_50m/labelmap.txt"
-# NUM_TRAIN_IMAGES = 669
-# NUM_VAL_IMAGES = 50
+# ── 경로 설정 (이 파일 위치 기준) ─────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))          # Train_DeepLab3/
+DATA_DIR = os.path.join(BASE_DIR, "Data")
 
-NUM_TRAIN_IMAGES = 2500
-NUM_VAL_IMAGES = 485
+# augmenter.py 산출물 (원본 + 증강본)
+AUG_IMG_DIR = os.path.join(DATA_DIR, "Aug_Images")
+AUG_MASK_DIR = os.path.join(DATA_DIR, "Aug_SegmentationClass")
 
+# 레이블맵 (현재 서빙 모델과 동일: 6클래스, 동일 순서/컬러)
+LABEL_PATH = os.path.join(DATA_DIR, "Source1_Labeling", "labelmap.txt")
 
+# 추가 학습(fine-tuning) 대상 = 현재 서빙 중인 모델
+# 학습 후 새 모델은 같은 폴더(../Modules/GarbageEye/models/)에 저장됩니다.
+MODEL_PATH = os.path.join(
+    BASE_DIR, "..", "Modules", "GarbageEye", "models",
+    "continued_model_2026-06-25_18-13-55.keras"
+)
 
-def main():    
-    # [1] 훈련용 데이터셋 준비
-    train_images = sorted(glob(os.path.join(DATA_DIR, 'Aug_Images/*')))[:NUM_TRAIN_IMAGES]
-    train_masks = sorted(glob(os.path.join(DATA_DIR, 'Aug_SegmentationClass/*')))[:NUM_TRAIN_IMAGES]
-    val_images = sorted(glob(os.path.join(DATA_DIR, 'Aug_Images/*')))[NUM_TRAIN_IMAGES:NUM_VAL_IMAGES+NUM_TRAIN_IMAGES]
-    val_masks = sorted(glob(os.path.join(DATA_DIR, 'Aug_SegmentationClass/*')))[NUM_TRAIN_IMAGES:NUM_VAL_IMAGES+NUM_TRAIN_IMAGES]
-    
-    print(len(train_images))
-    print(len(train_masks))
-    # validate_count_of_images_and_masks(train_images)
-    # print(os.getcwd())
-    train_dataset = data_generator(train_images, train_masks, LBAEL_PATH)
-    val_dataset = data_generator(val_images, val_masks, LBAEL_PATH)
+# ── 학습 설정 ─────────────────────────────────────────────────
+VAL_RATIO = 0.1          # 검증셋 비율
+EPOCHS = 60              # 최대 epoch (EarlyStopping이 최적점에서 자동 중단)
+LEARNING_RATE = 1e-5
+PATIENCE = 5             # val_loss가 PATIENCE epoch 동안 개선 없으면 중단
 
 
-    
-    # 출력된 클래스 ID가 0 ~ NUM_CLASSES - 1 범위인지 확인하는 함수
-    # validate_mask_classes(val_dataset)
+def original_stem(path):
+    """증강 파일명에서 원본 stem 추출 (GarbageSample_1_aug_003 → GarbageSample_1)"""
+    base = os.path.splitext(os.path.basename(path))[0]
+    return re.sub(r"_aug_\d+$", "", base)
 
-    # 배치 사이즈 만큼 무작위로 사진과 마스크 출력
-    # display_images_and_masks(train_dataset)
-    
-    # [1-1] 학습시
-    # model = train(train_dataset, val_dataset)
-    # [1-2]추가 학습시
-    model_path = '/home/keti_taehoon/SHRC_DeepLab3Plus_Learning/saved_model/continued_model_2025-11-17_17-43-53.keras'
-    continue_train(model_path, train_dataset, val_dataset, epochs=20)
-        
-    # [2] 모델 불러오기
-    # model = keras.models.load_model('SHRC_GarbageDetection/saved_model/continued_model_2025-11-04_12-15-16.keras')
-    # model = layers.TFSMLayer(
-    #     "SHRC_GarbageDetection/saved_model/model_2025-11-04 07:41:14",
-    #     call_endpoint="serving_default"  # 대부분 이 이름을 씁니다
-    # )
-    
 
-    # [3] 컬러맵 생성 
-    # colormap = create_colormap(LBAEL_PATH)    
-    
-    # [4] 추론
-    # plot_random_predictions(train_images, colormap, model=model)    
-    # acc = calculate_accuracy_from_dataset(val_dataset, model, "Random_Test_Acc")
-    # acc = calculate_random_accuracy(train_dataset, model, "Random_Test_Acc")
-    # generate_synthetic_accuracy()
-    # print(acc)
+def main():
+    # [0] 증강 데이터 존재 확인
+    if not os.path.isdir(AUG_IMG_DIR) or len(os.listdir(AUG_IMG_DIR)) == 0:
+        raise SystemExit(
+            "증강 데이터가 없습니다. 먼저 아래 명령으로 증강을 수행하세요:\n"
+            "    python Module/augmenter.py"
+        )
+
+    # [1] 이미지 ↔ 마스크 페어링 (파일명 stem 기준)
+    images = sorted(glob(os.path.join(AUG_IMG_DIR, "*")))
+    masks = sorted(glob(os.path.join(AUG_MASK_DIR, "*")))
+    mask_by_key = {os.path.splitext(os.path.basename(m))[0]: m for m in masks}
+
+    pairs = []
+    for im in images:
+        key = os.path.splitext(os.path.basename(im))[0]
+        if key in mask_by_key:
+            pairs.append((im, mask_by_key[key]))
+    if not pairs:
+        raise SystemExit("이미지와 매칭되는 마스크를 찾지 못했습니다. 경로를 확인하세요.")
+
+    # [2] train/val 분리 — 같은 원본의 증강본은 한쪽에만 (데이터 누수 방지)
+    groups = defaultdict(list)
+    for im, m in pairs:
+        groups[original_stem(im)].append((im, m))
+
+    stems = sorted(groups)
+    step = max(1, int(round(1 / VAL_RATIO)))      # VAL_RATIO=0.1 → 10개마다 1개를 val로
+    val_stems = set(stems[::step])
+
+    train_pairs = [p for s in stems if s not in val_stems for p in groups[s]]
+    val_pairs = [p for s in stems if s in val_stems for p in groups[s]]
+
+    train_images, train_masks = zip(*train_pairs)
+    val_images, val_masks = zip(*val_pairs)
+    print(f"원본 {len(stems)}장 | 전체 페어 {len(pairs)} "
+          f"| train {len(train_pairs)} | val {len(val_pairs)}")
+
+    train_dataset = data_generator(list(train_images), list(train_masks), LABEL_PATH)
+    val_dataset = data_generator(list(val_images), list(val_masks), LABEL_PATH)
+
+    # [3] 현재 모델에 이어서 추가 학습 (fine-tuning)
+    #     - 모델 구조/출력 채널은 기존 모델을 그대로 사용 (새로 만들지 않음)
+    #     - 새 모델은 MODEL_PATH와 같은 폴더에 continued_model_{시각}.keras 로 저장됨
+    continue_train(
+        MODEL_PATH,
+        train_dataset,
+        val_dataset,
+        epochs=EPOCHS,
+        learning_rate=LEARNING_RATE,
+        patience=PATIENCE,
+    )
+
 
 if __name__ == '__main__':
     main()

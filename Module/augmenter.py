@@ -23,12 +23,20 @@ from glob import glob
 import random
 from PIL import Image, ImageOps, ImageChops
 
-# ----------------
-IMG_DIR = "/home/keti_taehoon/SHRC_DeepLab3Plus_Learning/Data/TrainDataSet_Oct_50m/Images"
-MASK_DIR = "/home/keti_taehoon/SHRC_DeepLab3Plus_Learning/Data/TrainDataSet_Oct_50m/SegmentationClass"
-OUT_IMG_DIR = "/home/keti_taehoon/SHRC_DeepLab3Plus_Learning/Data/TrainDataSet_Oct_50m/Aug_Images"
-OUT_MASK_DIR = "/home/keti_taehoon/SHRC_DeepLab3Plus_Learning/Data/TrainDataSet_Oct_50m/Aug_SegmentationClass"
-# ----------------
+# ---------------- 경로 (이 파일 위치 기준) ----------------
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # Train_DeepLab3/
+DATA_DIR = os.path.join(BASE_DIR, "Data")
+
+# 증강 대상 소스들 (이미지 폴더, 마스크 폴더). 추가 데이터셋은 여기에 한 줄씩 추가.
+SOURCES = [
+    (os.path.join(DATA_DIR, "Source1_Image"),
+     os.path.join(DATA_DIR, "Source1_Labeling", "SegmentationClass")),
+    (os.path.join(DATA_DIR, "Source2_Image"),
+     os.path.join(DATA_DIR, "Source2_Labeling", "SegmentationClass")),
+]
+OUT_IMG_DIR = os.path.join(DATA_DIR, "Aug_Images")
+OUT_MASK_DIR = os.path.join(DATA_DIR, "Aug_SegmentationClass")
+# -----------------------------------------------------------
 
 
 def ensure_dir(p):
@@ -71,19 +79,31 @@ def save_pair(stem, idx, img, mask):
     mask.save(os.path.join(OUT_MASK_DIR, f"{stem}_aug_{idx:03d}.png"))
 
 
-def augment(stem, img_path, mask_path):
-    # 이미 증강된 결과가 존재하는지 검사
-    pattern = os.path.join(OUT_IMG_DIR, f"{stem}_aug_*.jpg")
-    existing = glob(pattern)
+NUM_VARIANTS = 8   # augment() 1장당 생성하는 증강본 수 (idx 0~7)
 
-    if len(existing) > 0:
+
+def augment(stem, img_path, mask_path):
+    # 이미 완전히 증강된 경우만 건너뜀. 부분 증강본은 지우고 다시 생성.
+    existing = glob(os.path.join(OUT_IMG_DIR, f"{stem}_aug_*.jpg"))
+
+    if len(existing) >= NUM_VARIANTS:
         print(f"[SKIP] {stem} 이미 증강됨 → 건너뜀")
         return
-    
+
+    if existing:
+        print(f"[REDO] {stem} 부분 증강({len(existing)}개) → 정리 후 재생성")
+        for f in existing:
+            os.remove(f)
+        for f in glob(os.path.join(OUT_MASK_DIR, f"{stem}_aug_*.png")):
+            os.remove(f)
+
     img = Image.open(img_path)
     mask = Image.open(mask_path)
 
-    idx = 1
+    idx = 0
+
+    # 원본도 학습 데이터에 포함
+    save_pair(stem, idx, img, mask); idx += 1
 
     # 좌우 플립
     img2 = ImageOps.mirror(img)
@@ -154,21 +174,26 @@ def augment(stem, img_path, mask_path):
 
 
 def main():
-    image_files = []
-    exts = ["*.png", "*.jpg"]
-    for ext in exts:
-        pattern = os.path.join(IMG_DIR, ext)
-        image_files.extend(glob(pattern))
-
-    for img_path in image_files:
-        stem = os.path.splitext(os.path.basename(img_path))[0]
-        mask_path = os.path.join(MASK_DIR, stem + ".png")
-
-        if not os.path.isfile(mask_path):
-            print(f"[WARN] Missing mask for {stem}, skipped")
+    exts = ["*.png", "*.jpg", "*.jpeg", "*.JPG", "*.JPEG", "*.PNG"]
+    for img_dir, mask_dir in SOURCES:
+        if not os.path.isdir(img_dir):
+            print(f"[WARN] 소스 폴더 없음: {img_dir} → 건너뜀")
             continue
+        print(f"[SOURCE] {img_dir}")
 
-        augment(stem, img_path, mask_path)
+        image_files = []
+        for ext in exts:
+            image_files.extend(glob(os.path.join(img_dir, ext)))
+
+        for img_path in image_files:
+            stem = os.path.splitext(os.path.basename(img_path))[0]
+            mask_path = os.path.join(mask_dir, stem + ".png")
+
+            if not os.path.isfile(mask_path):
+                print(f"[WARN] Missing mask for {stem}, skipped")
+                continue
+
+            augment(stem, img_path, mask_path)
 
     print("Augmentation complete!")
 

@@ -235,7 +235,39 @@ def train(train_dataset, val_dataset):
     return model
 
 
-def continue_train(model_path, train_dataset, val_dataset, epochs=10, learning_rate=1e-5):
+def _plot_history(history, out_dir, timestamp):
+    """loss / garbage IoU 학습 곡선을 저장"""
+    plt.switch_backend('Agg')  # 헤드리스 환경 대비
+    epochs = range(1, len(history['loss']) + 1)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Loss
+    axes[0].plot(epochs, history['loss'], 'b-', label='train_loss')
+    axes[0].plot(epochs, history['val_loss'], 'r-', label='val_loss')
+    axes[0].set_title('Loss'); axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Loss')
+    axes[0].grid(True); axes[0].legend()
+
+    # Garbage IoU (없으면 accuracy로 대체)
+    if 'garbage_iou' in history:
+        axes[1].plot(epochs, history['garbage_iou'], 'b-', label='train_IoU')
+        axes[1].plot(epochs, history['val_garbage_iou'], 'r-', label='val_IoU')
+        axes[1].set_title('Garbage IoU')
+    else:
+        axes[1].plot(epochs, history['accuracy'], 'b-', label='train_acc')
+        axes[1].plot(epochs, history['val_accuracy'], 'r-', label='val_acc')
+        axes[1].set_title('Accuracy')
+    axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('Score')
+    axes[1].grid(True); axes[1].legend()
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, f'loss_iou_{timestamp}.png')
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"그래프 저장: {path}")
+
+
+def continue_train(model_path, train_dataset, val_dataset, epochs=10, learning_rate=1e-5,
+                   patience=5, out_dir='train_outputs'):
     # [1] GPU 메모리 설정 (선택 사항)
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
@@ -244,46 +276,73 @@ def continue_train(model_path, train_dataset, val_dataset, epochs=10, learning_r
                 tf.config.experimental.set_memory_growth(gpu, True)
         except RuntimeError as e:
             print(e)
-    
-    # [2] MirroredStrategy 초기화
+
+    # [2] 저장 경로 준비
+    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  # 파일명에 콜론(:) 사용 피하기
+    save_dir = os.path.dirname(model_path)                       # 서빙 모델 폴더에 저장
+    best_model_path = os.path.join(save_dir, f'continued_model_{current_time}.keras')
+    os.makedirs(out_dir, exist_ok=True)                          # history/그래프 출력 폴더
+
+    # [3] MirroredStrategy + 모델 로드/재컴파일
     strategy = tf.distribute.MirroredStrategy()
-    
     with strategy.scope():
-        # [3] 기존 모델 로드
+        # [3-1] 기존 모델 로드
         print(f"모델 로드 중: {model_path}")
         model = keras.models.load_model(model_path)
-        
         model.summary()
         print("Model output shape:", model.output_shape)
-        
-        # [4] 모델 재컴파일 (학습률 변경 등을 위해)
+
+        # [3-2] 재컴파일 — 내장 IoU 사용(sparse_y_pred=False → 로짓 자동 argmax).
+        #       서빙(compile=True 로드)에서도 안전하게 역직렬화됨.
         loss = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+        garbage_iou = keras.metrics.IoU(
+            num_classes=NUM_CLASSES, target_class_ids=[1],
+            name='garbage_iou', sparse_y_pred=False
+        )
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
             loss=loss,
-            metrics=['accuracy']
+            metrics=['accuracy', garbage_iou]
         )
-        
-        # [5] 추가 학습 진행
-        print(f"\n추가 학습 시작 ({epochs} 에포크)")
-        history = model.fit(
-            train_dataset,
-            validation_data=val_dataset,
-            epochs=epochs
-        )
-    
-    # [6] 모델 저장
-    current_time = datetime.now()
-    formatted_time = current_time.strftime("%Y-%m-%d_%H-%M-%S")  # 파일명에 콜론(:) 사용 피하기
-    
-    save_dir = os.path.dirname(model_path)
-    save_path = os.path.join(save_dir, f'continued_model_{formatted_time}.keras')
-    # [6-1] keras 형식으로 저장
-    model.save(save_path)
-    
-    # [6-2] TensorFlow 디렉토리 형식으로 저장
-    # save_path = f'SHRC_DeepLab3Plus_Learning/saved_model/continued_model_{formatted_time}'
-    model.export(save_path)
-    print(f"\n모델이 성공적으로 저장되었습니다: {save_path}")
-    
+
+    # [4] 콜백 — val 최고 모델 저장 + 오버피팅 시 조기 종료
+    callbacks = [
+        keras.callbacks.ModelCheckpoint(
+            filepath=best_model_path,
+            monitor='val_loss',
+            save_best_only=True,
+            verbose=1
+        ),
+        keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=patience,
+            restore_best_weights=True,
+            verbose=1
+        ),
+    ]
+
+    # [5] 추가 학습 진행
+    print(f"\n추가 학습 시작 (최대 {epochs} 에포크, EarlyStopping patience={patience})")
+    history = model.fit(
+        train_dataset,
+        validation_data=val_dataset,
+        epochs=epochs,
+        callbacks=callbacks
+    )
+
+    # [6] history(json) 저장
+    hist_path = os.path.join(out_dir, f'history_{current_time}.json')
+    with open(hist_path, 'w') as f:
+        json.dump(history.history, f, indent=2)
+    print(f"학습 이력 저장: {hist_path}")
+
+    # [7] loss / IoU 그래프 저장
+    _plot_history(history.history, out_dir, current_time)
+
+    # [8] 결과 요약 (best 가중치는 ModelCheckpoint + restore_best_weights로 이미 저장됨)
+    val_losses = history.history['val_loss']
+    best_epoch = val_losses.index(min(val_losses)) + 1
+    print(f"\n최적 모델 저장 완료: {best_model_path}")
+    print(f"최적 epoch: {best_epoch}/{len(val_losses)}  (val_loss={min(val_losses):.4f})")
+
     return history, model
